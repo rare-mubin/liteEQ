@@ -1,0 +1,21 @@
+[package]
+name = "liteeq"
+version = "0.1.0"
+edition = "2024"
+license = "MIT AND LGPL-2.0-or-later"
+description = "Lightweight terminal bass enhancer (Calf Bass Enhancer DSP on a PipeWire virtual sink)"
+
+[[bin]]
+name = "lite-eq"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+pipewire = { version = "0.10.1", features = ["v0_3_49"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
