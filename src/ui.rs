@@ -2,7 +2,7 @@
 //! buttons and hints live in the border itself. Every clickable element registers
 //! a hitbox while it is drawn, so mouse handling in `main` never repeats layout maths.
 
-use crate::audio::Status;
+use crate::remote::Status;
 use crate::dsp::lin_to_db;
 use crate::settings::{Param, Settings};
 use crate::viz::{self, Analyzer, VizStyle};
@@ -61,6 +61,11 @@ pub enum Target {
     CloseSettings,
     Backdrop,
     Viz,
+    /// Windows: install liteEQ into Equalizer APO / take it out again.
+    EapoInstall,
+    EapoRemove,
+    /// Equalizer APO device choice (index into `EapoView::labels`; 0 = all).
+    EapoDevice(u8),
 }
 
 #[derive(Default)]
@@ -126,10 +131,24 @@ pub struct View<'a> {
     pub hover: Option<Target>,
     pub viz_style: VizStyle,
     pub analyzer: &'a Analyzer,
-    /// `None` when there is no systemd user session to manage a login unit.
+    /// `None` when start-at-login cannot be managed (e.g. no systemd user session).
     pub autostart: Option<bool>,
     pub keep_running: bool,
     pub settings_open: bool,
+    /// Controlling the Equalizer APO plugin rather than the service.
+    pub plugin: bool,
+    /// Equalizer APO is installed (Windows): offers Install, or the device choice.
+    pub eapo: Option<EapoView<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct EapoView<'a> {
+    /// "All" first, then each output device Equalizer APO is on.
+    pub labels: &'a [String],
+    /// Which of `labels` the plugin applies to (`None`: a custom pattern).
+    pub selected: Option<usize>,
+    /// liteEQ is in Equalizer APO's config.
+    pub set_up: bool,
 }
 
 pub const MIN_W: u16 = 40;
@@ -261,10 +280,20 @@ pub fn draw(f: &mut Frame, v: &View) -> Hits {
     hits
 }
 
-fn status_parts(status: &Status) -> (&'static str, String, Color) {
+/// Why the plugin is not running (Windows): Equalizer APO missing, not set up, or just idle.
+fn plugin_stopped(v: &View) -> (&'static str, &'static str) {
+    match v.eapo {
+        None => ("no Equalizer APO", "Equalizer APO is not installed · see Settings (,)"),
+        Some(e) if !e.set_up => ("not set up", "not set up · open Settings (,) and press Install"),
+        Some(_) => ("plugin idle", "plugin idle · play something"),
+    }
+}
+
+fn status_parts(status: &Status, v: Option<&View>) -> (&'static str, String, Color) {
     match status {
         Status::Starting => ("◌", "starting".into(), Color::Yellow),
         Status::Running => ("●", "running".into(), GREEN),
+        Status::Stopped if v.is_some_and(|v| v.plugin) => ("○", plugin_stopped(v.unwrap()).0.into(), Color::Yellow),
         Status::Stopped => ("○", "service stopped".into(), RED),
         Status::Error(e) => ("●", format!("error: {e}"), RED),
     }
@@ -277,6 +306,7 @@ fn draw_viz(f: &mut Frame, r: Rect, v: &View, hits: &mut Hits) {
     // Visualizer fills the panel; a click cycles the view.
     hits.add(inner, Target::Viz);
     let empty = match v.status {
+        Status::Stopped if v.plugin => plugin_stopped(v).1,
         Status::Stopped => "service stopped · press s to start",
         _ => "waiting for audio",
     };
@@ -285,7 +315,7 @@ fn draw_viz(f: &mut Frame, r: Rect, v: &View, hits: &mut Hits) {
     // --- top border: brand, view buttons and Settings on the left; route + status
     // on the right. On narrow terminals the view buttons drop out (a click on the
     // graph or `v` still cycles the view) and the status shrinks to a dot.
-    let (dot, label, color) = status_parts(v.status);
+    let (dot, label, color) = status_parts(v.status, Some(v));
     let status_full = Chip::new(format!("{dot} {label}"), Style::new().fg(color));
     let status_dot = Chip::new(dot, Style::new().fg(color));
     let brand = || {
@@ -514,6 +544,36 @@ fn switch(f: &mut Frame, hits: &mut Hits, x: u16, y: u16, on: bool, which: Setti
     w1 + w2
 }
 
+/// A solid button; returns its width.
+fn button(f: &mut Frame, hits: &mut Hits, x: u16, y: u16, label: &str, colour: Color, target: Target, v: &View) -> u16 {
+    let hot = v.hover == Some(target);
+    let style = if hot { Style::new().fg(Color::Black).bg(Color::White).bold() } else { Style::new().fg(Color::Black).bg(colour).bold() };
+    let w = text(f, x, y, label, style);
+    hits.add(Rect::new(x, y, w, 1), target);
+    w
+}
+
+/// `[ All ][ MOONDROP Dawn Pro ]…`: the Equalizer APO device choice, clipped to `max_x`.
+fn device_choice(f: &mut Frame, hits: &mut Hits, mut x: u16, y: u16, max_x: u16, e: &EapoView, v: &View) {
+    for (i, label) in e.labels.iter().enumerate() {
+        let target = Target::EapoDevice(i as u8);
+        let seg = format!(" {label} ");
+        let w = seg.chars().count() as u16;
+        if x + w > max_x {
+            text(f, x, y, "…", Style::new().fg(DIM));
+            break;
+        }
+        let style = match (e.selected == Some(i), v.hover == Some(target)) {
+            (true, _) => Style::new().fg(Color::Black).bg(GREEN).bold(),
+            (false, true) => Style::new().fg(Color::White).bg(BTN_HOVER),
+            (false, false) => Style::new().fg(DIM).bg(BTN_BG),
+        };
+        text(f, x, y, &seg, style);
+        hits.add(Rect::new(x, y, w, 1), target);
+        x += w + 1;
+    }
+}
+
 /// The settings window: a centred modal over everything else.
 fn draw_settings_popup(f: &mut Frame, area: Rect, v: &View, hits: &mut Hits) {
     let w = 64.min(area.width.saturating_sub(4));
@@ -544,7 +604,16 @@ fn draw_settings_popup(f: &mut Frame, area: Rect, v: &View, hits: &mut Hits) {
     } else {
         let hint = |label: &str, keys: usize| Chip::new(label, Style::new().fg(DIM)).hot(keys, Style::new().fg(ACCENT_HI).bold());
         let mut x = r.x + 2;
-        for chip in [hint("s service", 1), hint("a login", 1), hint("p keep", 1), hint("esc close", 3)] {
+        let hints = if v.plugin {
+            match v.eapo {
+                Some(e) if e.set_up => vec![hint("d device", 1), hint("u remove", 1), hint("esc close", 3)],
+                Some(_) => vec![hint("e install", 1), hint("esc close", 3)],
+                None => vec![hint("esc close", 3)],
+            }
+        } else {
+            vec![hint("s service", 1), hint("a login", 1), hint("p keep", 1), hint("esc close", 3)]
+        };
+        for chip in hints {
             if x + chip.width() + 2 > r.x + r.width {
                 break;
             }
@@ -564,10 +633,54 @@ fn draw_settings_popup(f: &mut Frame, area: Rect, v: &View, hits: &mut Hits) {
     };
     let vx = lx + LABEL_W;
 
+    if v.plugin && !v.eapo.is_some_and(|e| e.set_up) {
+        // Windows, not set up yet: only Equalizer APO matters here.
+        let y = inner.y + 1;
+        label(f, y, "Equalizer APO");
+        if v.eapo.is_some() {
+            text(f, vx, y, "found", Style::new().fg(TEXT));
+            button(f, hits, vx + 7, y, " Install ", GREEN, Target::EapoInstall, v);
+            hint(f, y + 1, "adds liteEQ to it: no added latency, no cable");
+        } else {
+            text(f, vx, y, "not installed", Style::new().fg(RED));
+            hint(f, y + 1, "get it at sourceforge.net/projects/equalizerapo,");
+            hint(f, y + 2, "enable it for your output in its Configurator,");
+            hint(f, y + 3, "then open these settings again");
+        }
+        return;
+    }
+
+    if v.plugin {
+        // Equalizer APO runs the effect: nothing to start, stop or autostart.
+        let y = inner.y + 1;
+        label(f, y, "Effect");
+        let (dot, word, color) = match v.status {
+            Status::Running => ("●", "active in Equalizer APO", GREEN),
+            _ => ("○", "idle (no audio, or not loaded)", Color::Yellow),
+        };
+        text(f, vx, y, &format!("{dot} {word}"), Style::new().fg(color));
+        hint(f, y + 1, "always on inside Windows audio; the app is a remote");
+        let y = inner.y + 4;
+        label(f, y, "Device");
+        match &v.eapo {
+            Some(e) if !e.labels.is_empty() => device_choice(f, hits, vx, y, inner.x + inner.width - 1, e, v),
+            _ => {
+                text(f, vx, y, "custom (see config\\liteeq.txt)", Style::new().fg(DIM));
+            }
+        }
+        hint(f, y + 1, "the outputs that get the effect");
+        let y = inner.y + 7;
+        label(f, y, "Equalizer APO");
+        text(f, vx, y, "installed", Style::new().fg(GREEN));
+        button(f, hits, vx + 11, y, " Remove ", PINK, Target::EapoRemove, v);
+        hint(f, y + 1, "takes liteEQ out of Equalizer APO's config");
+        return;
+    }
+
     // Service: state + Start/Stop button on the right.
     let y = inner.y + 1;
     label(f, y, "Service");
-    let (dot, word, color) = status_parts(v.status);
+    let (dot, word, color) = status_parts(v.status, None);
     let word = match v.status {
         Status::Error(_) => "failed".to_string(),
         Status::Stopped => "stopped".to_string(),
@@ -624,6 +737,11 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render(w: u16, h: u16, status: Status, open: bool) -> (String, usize) {
+        render_with(w, h, status, open, false, false)
+    }
+
+    fn render_with(w: u16, h: u16, status: Status, open: bool, plugin: bool, eapo: bool) -> (String, usize) {
+        let labels = ["All".to_string(), "MOONDROP Dawn Pro".to_string()];
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         let s = Settings { amount_db: 8.0, scope: 250.0, input_db: -8.1, floor_active: true, ..Settings::default() };
         let meters = MeterView { in_l: -21.0, in_r: -21.0, out_l: -7.0, out_r: -7.0, harmonics: -10.0 };
@@ -646,6 +764,8 @@ mod tests {
                 autostart: Some(true),
                 keep_running: true,
                 settings_open: open,
+                plugin,
+                eapo: eapo.then_some(EapoView { labels: &labels, selected: Some(1), set_up: plugin }),
             };
             n_hits = draw(f, &v).0.len();
         })
@@ -653,6 +773,36 @@ mod tests {
         let buf = t.backend().buffer().clone();
         let text = (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n");
         (text, n_hits)
+    }
+
+    #[test]
+    fn plugin_mode_has_no_service_controls() {
+        let (text, _) = render_with(120, 34, Status::Running, true, true, true);
+        assert!(text.contains("active in Equalizer APO"), "{text}");
+        assert!(text.contains(" MOONDROP Dawn Pro ") && text.contains(" Remove "), "{text}");
+        assert!(!text.contains(" Stop "), "no service button");
+        let (idle, _) = render_with(120, 34, Status::Stopped, false, true, true);
+        assert!(idle.contains("plugin idle"), "{idle}");
+    }
+
+    #[test]
+    fn windows_popup_shows_only_equalizer_apo() {
+        // Windows, Equalizer APO missing: no service/login/keep rows.
+        let (text, _) = render_with(120, 34, Status::Stopped, true, true, false);
+        assert!(text.contains("not installed"), "{text}");
+        for row in ["Service", "Start at login", "Keep running"] {
+            assert!(!text.contains(row), "{row} shown:\n{text}");
+        }
+        assert!(text.contains("no Equalizer APO"), "status chip");
+    }
+
+    #[test]
+    fn popups_fit_in_a_cramped_terminal() {
+        for (w, h) in [(40, 20), (70, 24), (120, 34)] {
+            render_with(w, h, Status::Stopped, true, true, false); // Windows, no Equalizer APO
+            render_with(w, h, Status::Stopped, true, true, true); // Windows, Equalizer APO found
+            render_with(w, h, Status::Running, true, false, false); // Linux service
+        }
     }
 
     #[test]

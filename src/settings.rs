@@ -161,10 +161,13 @@ fn config_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("LITEEQ_CONFIG_DIR") {
         return Some(PathBuf::from(dir).join("settings.conf"));
     }
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("liteeq").join("settings.conf"))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    Some(base?.join("liteeq").join("settings.conf"))
 }
 
 fn parse_flag(v: &str) -> bool {

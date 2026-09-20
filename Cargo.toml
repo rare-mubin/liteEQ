@@ -3,16 +3,42 @@ name = "liteeq"
 version = "0.1.0"
 edition = "2024"
 license = "MIT AND LGPL-2.0-or-later"
-description = "Lightweight terminal bass enhancer (Calf Bass Enhancer DSP on a PipeWire virtual sink)"
+description = "Lightweight terminal bass enhancer (Calf Bass Enhancer DSP on a PipeWire virtual sink / WASAPI virtual cable)"
 
 [[bin]]
 name = "lite-eq"
 path = "src/main.rs"
 
+# Windows: the Equalizer APO plugin (`liteeq_vst.dll`, installed by `lite-eq setup`).
+# Empty on other platforms.
+[lib]
+name = "liteeq_vst"
+path = "src/plugin/lib.rs"
+crate-type = ["cdylib"]
+
 [dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 pipewire = { version = "0.10.1", features = ["v0_3_49"] }
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.5"
+windows = { version = "0.61", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
 
 [profile.release]
 opt-level = 3

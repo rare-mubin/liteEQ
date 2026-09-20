@@ -16,7 +16,7 @@ fn unit_path() -> Option<PathBuf> {
     Some(base.join("systemd").join("user").join(UNIT))
 }
 
-fn log_path() -> Option<PathBuf> {
+pub fn log_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).or_else(|| home().map(|h| h.join(".local").join("state")))?;
     Some(base.join("liteeq").join("daemon.log"))
 }

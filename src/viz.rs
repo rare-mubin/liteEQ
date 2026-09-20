@@ -119,7 +119,16 @@ pub struct Analyzer {
 
 impl Analyzer {
     pub fn new() -> Self {
-        let bin_hz = SAMPLE_RATE as f32 / FFT_N as f32;
+        Self::with_sample_rate(SAMPLE_RATE)
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        (self.bin_hz * FFT_N as f32).round() as u32
+    }
+
+    /// The analyser for audio at `sample_rate` (the Equalizer APO plugin runs at the device's rate).
+    pub fn with_sample_rate(sample_rate: u32) -> Self {
+        let bin_hz = sample_rate as f32 / FFT_N as f32;
         let max_bin = (F_MAX / bin_hz).ceil() as usize + 2;
         // 4-term Blackman-Harris: ~-92 dB sidelobes keep a pure tone from smearing.
         let window = (0..FFT_N)

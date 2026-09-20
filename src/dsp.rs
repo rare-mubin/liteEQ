@@ -181,23 +181,30 @@ pub struct BassEnhancer {
     dist: [TapDistortion; 2],
     freq_old: f32,
     floor_old: f32,
+    sample_rate: u32,
 }
 
 impl BassEnhancer {
     pub fn new() -> Self {
+        Self::with_sample_rate(SAMPLE_RATE)
+    }
+
+    /// For hosts that run at the device's own rate (the Equalizer APO plugin).
+    pub fn with_sample_rate(sample_rate: u32) -> Self {
         let mut s = Self {
             lp: [[Biquad::default(); 4]; 2],
             hp: [[Biquad::default(); 2]; 2],
-            dist: [TapDistortion::new(SAMPLE_RATE), TapDistortion::new(SAMPLE_RATE)],
+            dist: [TapDistortion::new(sample_rate), TapDistortion::new(sample_rate)],
             freq_old: f32::NAN,
             floor_old: f32::NAN,
+            sample_rate,
         };
         s.update_filters(&Settings::default());
         s
     }
 
     fn update_filters(&mut self, s: &Settings) {
-        let sr = SAMPLE_RATE as f32;
+        let sr = self.sample_rate as f32;
         if s.scope != self.freq_old {
             let lp = Biquad::lowpass(s.scope, 0.707, sr);
             for ch in self.lp.iter_mut() {

@@ -18,14 +18,7 @@ pub const SINK_NAME: &str = "liteeq_sink";
 const CHANNELS: usize = 2;
 const BYTES_PER_FRAME: usize = CHANNELS * 4;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Status {
-    Starting,
-    Running,
-    Error(String),
-    /// The background service is not running (client side only).
-    Stopped,
-}
+pub use crate::remote::Status;
 
 /// Peak meters. Values are non-negative f32 stored as bits, so `fetch_max` on
 /// the raw bits is a correct float max; the UI takes-and-resets each frame.

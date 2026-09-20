@@ -2,14 +2,15 @@
 
 **Version 0.1.0**
 
-A lightweight terminal bass enhancer for Linux, written in Rust. It uses the same
+A lightweight terminal bass enhancer for Linux and Windows, written in Rust. It uses the same
 DSP as the Calf Bass Enhancer in EasyEffects, with a dot
 visualizer. The effect runs as a background service, so closing the app doesn't
 stop your audio.
 
 ![liteEQ v0.1.0](screenshot/liteEQ_v0.1.0_screenshot.png)
 
-Needs **PipeWire** (with `pipewire-pulse` and `pactl`).
+Needs **PipeWire** (with `pipewire-pulse` and `pactl`) on Linux, or
+**Equalizer APO** on Windows ([see below](#windows)).
 
 ## Install
 
@@ -64,6 +65,42 @@ Needs **PipeWire** (with `pipewire-pulse` and `pactl`).
    ```
 
 `cargo install` puts `lite-eq` in `~/.cargo/bin`. Make sure that folder is in your `PATH`.
+
+## Windows
+
+liteEQ runs as a plugin of [Equalizer APO](https://sourceforge.net/projects/equalizerapo/),
+inside the Windows audio engine on your real output device. There is no added
+latency, no virtual device and no background service, and the effect is active
+whenever Windows plays audio, including at login.
+
+1. Install Equalizer APO. In its Configurator, tick your speakers or headphones,
+   then reboot if it asks.
+2. Install [Rust](https://rustup.rs) 1.85 or newer (either the `x86_64-pc-windows-msvc`
+   or the `x86_64-pc-windows-gnu` toolchain).
+3. Build liteEQ and add the plugin to Equalizer APO:
+
+   ```powershell
+   cargo build --release
+   target\release\lite-eq setup
+   ```
+
+   You can also do this in the app: open **Settings** and press **Install** (key
+   `e`). The same place lets you choose which output gets the effect (key `d`)
+   or remove it again (key `u`).
+4. Run `target\release\lite-eq` (or copy it anywhere on your `PATH`) to control it.
+
+`setup` copies `liteeq_vst.dll` into Equalizer APO's `VSTPlugins` folder, writes
+`config\liteeq.txt` and adds `Include: liteeq.txt` to the end of `config.txt`
+(backed up as `config.txt.liteeq-backup`). No admin rights are needed. Run it
+again after rebuilding to update the plugin, and `lite-eq setup --remove` to
+uninstall. `--device <PATTERN>` limits the effect to matching devices.
+
+Settings are saved in `%APPDATA%\liteeq` and shared with the plugin through
+`%ProgramData%\liteEQ\liteeq.shm`. Use a terminal with mouse support, such as
+Windows Terminal.
+
+If you use Peace, it may rewrite `config.txt` and drop the `Include: liteeq.txt`
+line. Run `lite-eq setup` again if the app says "not set up" while audio plays.
 
 ## Build only
 

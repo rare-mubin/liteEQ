@@ -16,6 +16,7 @@
 //! an idle service costs a ~50 byte reply per poll.
 
 use crate::audio::{Shared, Status};
+pub use crate::remote::Frame;
 use crate::dsp::BlockMeters;
 use crate::settings::Settings;
 use crate::viz::FFT_N;
@@ -106,14 +107,6 @@ pub fn handle_request(shared: &Shared, line: &str, out: &mut impl Write) -> io::
 // Client side
 // ---------------------------------------------------------------------------
 
-/// One poll's worth of live data from the service.
-pub struct Frame {
-    pub status: Status,
-    pub meters: BlockMeters,
-    /// New audio for the visualizer, present only if it changed.
-    pub samples: Option<(Vec<f32>, Vec<f32>)>,
-}
-
 pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -180,7 +173,8 @@ impl Client {
         } else {
             None
         };
-        Ok(Frame { status, meters: BlockMeters { in_l: m[0], in_r: m[1], out_l: m[2], out_r: m[3], harmonics: m[4] }, samples })
+        let meters = BlockMeters { in_l: m[0], in_r: m[1], out_l: m[2], out_r: m[3], harmonics: m[4] };
+        Ok(Frame { status, meters, samples, sample_rate: crate::dsp::SAMPLE_RATE })
     }
 }
 
