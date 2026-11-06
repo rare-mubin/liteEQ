@@ -93,6 +93,17 @@ pub struct Shared {
     pub scope: Mutex<Scope>,
     /// Human-readable routing, e.g. `liteeq_sink → device`; set once the service is up.
     pub route: Mutex<String>,
+    /// Whether the playback stream to the real device is alive. The session
+    /// manager destroys it when that device goes away (`node.dont-reconnect`),
+    /// and the service then rebuilds it (`Cmd::Retarget`).
+    pub output_ok: AtomicBool,
+}
+
+/// Messages from the service to the audio loop.
+pub enum Cmd {
+    Quit,
+    /// (Re)build the playback stream on this device.
+    Retarget(String),
 }
 
 impl Shared {
@@ -103,6 +114,7 @@ impl Shared {
             status: Mutex::new(Status::Starting),
             scope: Mutex::new(Scope::new()),
             route: Mutex::new(String::new()),
+            output_ok: AtomicBool::new(false),
         })
     }
 
@@ -211,21 +223,15 @@ pub fn run(
     shared: Arc<Shared>,
     sink_name: String,
     output_target: Option<String>,
-    quit: pw::channel::Receiver<()>,
+    cmds: pw::channel::Receiver<Cmd>,
 ) -> Result<(), pw::Error> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
 
-    let _quit = quit.attach(mainloop.loop_(), {
-        let mainloop = mainloop.clone();
-        move |_| mainloop.quit()
-    });
-
     let bridge = Arc::new(Mutex::new(Bridge { q: VecDeque::new(), primed: false }));
     let latency = format!("256/{SAMPLE_RATE}");
-    let out_name = format!("{sink_name}_output");
 
     // --- virtual sink: apps play into this ---------------------------------
     let sink_props = properties! {
@@ -319,69 +325,136 @@ pub fn run(
         })
         .register()?;
 
-    // --- playback: the enhanced signal goes to the real device -------------
-    let mut out_props = properties! {
-        "media.type" => "Audio",
-        "media.category" => "Playback",
-        "media.role" => "Music",
-        "node.name" => out_name.as_str(),
-        "node.description" => "liteEQ Output",
-        "node.latency" => latency.as_str(),
-        // Stay on the chosen device: without this the session manager moves the
-        // stream to the new default sink (liteeq_sink itself) => feedback loop.
-        "node.dont-reconnect" => "true",
-    };
-    if let Some(t) = &output_target {
-        out_props.insert("target.object", t.as_str());
-    }
-    let out = pw::stream::StreamBox::new(&core, &format!("{}-output", sink_name.replace('_', "-")), out_props)?;
-    let _out_listener = out
-        .add_local_listener_with_user_data(bridge.clone())
-        .state_changed({
-            let shared = shared.clone();
-            move |_, _, _, new| {
-                if let pw::stream::StreamState::Error(e) = new {
-                    shared.set_status(Status::Error(format!("output: {e}")));
-                }
-            }
-        })
-        .process(|stream, bridge| {
-            let Some(mut buffer) = stream.dequeue_buffer() else { return };
-            let requested = buffer.requested() as usize;
-            let Some(data) = buffer.datas_mut().first_mut() else { return };
-            let frames = {
-                let Some(bytes) = data.data() else { return };
-                let cap = bytes.len() / BYTES_PER_FRAME;
-                let frames = if requested > 0 { requested.min(cap) } else { cap };
-
-                let mut b = bridge.lock().unwrap();
-                if !b.primed && b.q.len() >= frames * CHANNELS * 2 {
-                    b.primed = true;
-                }
-                if b.primed && b.q.len() < frames * CHANNELS {
-                    b.primed = false; // underrun: emit silence until the ring refills
-                }
-                for out in bytes[..frames * BYTES_PER_FRAME].chunks_exact_mut(4) {
-                    let v = if b.primed { b.q.pop_front().unwrap_or(0.0) } else { 0.0 };
-                    out.copy_from_slice(&v.to_le_bytes());
-                }
-                frames
-            };
-            let chunk = data.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = BYTES_PER_FRAME as i32;
-            *chunk.size_mut() = (frames * BYTES_PER_FRAME) as u32;
-        })
-        .register()?;
-
-    let flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS;
-    let out_flags = flags | pw::stream::StreamFlags::DONT_RECONNECT;
     let pod_bytes = format_pod();
     let mut params = [Pod::from_bytes(&pod_bytes).expect("format pod")];
-    sink.connect(spa::utils::Direction::Input, None, flags, &mut params)?;
-    let mut params = [Pod::from_bytes(&pod_bytes).expect("format pod")];
-    out.connect(spa::utils::Direction::Output, None, out_flags, &mut params)?;
+    sink.connect(spa::utils::Direction::Input, None, STREAM_FLAGS, &mut params)?;
+
+    let output = std::rc::Rc::new(std::cell::RefCell::new(Some(Output::connect(
+        core.clone(),
+        &shared,
+        &bridge,
+        &sink_name,
+        output_target.as_deref(),
+    )?)));
+    let _cmds = cmds.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        let core = core.clone();
+        move |cmd| match cmd {
+            Cmd::Quit => mainloop.quit(),
+            Cmd::Retarget(target) => {
+                // Tear the old stream down first: it may still hold the old device.
+                output.borrow_mut().take();
+                if let Ok(mut b) = bridge.lock() {
+                    b.q.clear();
+                    b.primed = false;
+                }
+                match Output::connect(core.clone(), &shared, &bridge, &sink_name, Some(&target)) {
+                    Ok(o) => {
+                        *output.borrow_mut() = Some(o);
+                        let mut st = shared.status.lock().unwrap();
+                        if matches!(&*st, Status::Error(e) if e.starts_with("output:")) {
+                            *st = Status::Running;
+                        }
+                    }
+                    Err(e) => shared.set_status(Status::Error(format!("output: {e}"))),
+                }
+            }
+        }
+    });
 
     mainloop.run();
     Ok(())
+}
+
+const STREAM_FLAGS: pw::stream::StreamFlags = pw::stream::StreamFlags::AUTOCONNECT
+    .union(pw::stream::StreamFlags::MAP_BUFFERS)
+    .union(pw::stream::StreamFlags::RT_PROCESS);
+
+/// The playback stream to the real device. Rebuilt whenever the device changes.
+struct Output {
+    _listener: pw::stream::StreamListener<Arc<Mutex<Bridge>>>,
+    stream: pw::stream::StreamRc,
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        let _ = self.stream.disconnect();
+    }
+}
+
+impl Output {
+    fn connect(
+        core: pw::core::CoreRc,
+        shared: &Arc<Shared>,
+        bridge: &Arc<Mutex<Bridge>>,
+        sink_name: &str,
+        output_target: Option<&str>,
+    ) -> Result<Self, pw::Error> {
+        shared.output_ok.store(false, Relaxed);
+        let latency = format!("256/{SAMPLE_RATE}");
+        let out_name = format!("{sink_name}_output");
+        let mut out_props = properties! {
+            "media.type" => "Audio",
+            "media.category" => "Playback",
+            "media.role" => "Music",
+            "node.name" => out_name.as_str(),
+            "node.description" => "liteEQ Output",
+            "node.latency" => latency.as_str(),
+            // Stay on the chosen device: without this the session manager moves the
+            // stream to the new default sink (liteeq_sink itself) => feedback loop.
+            "node.dont-reconnect" => "true",
+            // If the device vanished just before we connect, stay unlinked rather
+            // than fall back to the default sink (liteeq_sink itself).
+            "node.dont-fallback" => "true",
+        };
+        if let Some(t) = output_target {
+            out_props.insert("target.object", t);
+        }
+        let out = pw::stream::StreamRc::new(core, &format!("{}-output", sink_name.replace('_', "-")), out_props)?;
+        let out_listener = out
+            .add_local_listener_with_user_data(bridge.clone())
+            .state_changed({
+                let shared = shared.clone();
+                move |_, _, _, new| {
+                    let ok = matches!(new, pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming);
+                    shared.output_ok.store(ok, Relaxed);
+                    if let pw::stream::StreamState::Error(e) = new {
+                        shared.set_status(Status::Error(format!("output: {e}")));
+                    }
+                }
+            })
+            .process(|stream, bridge| {
+                let Some(mut buffer) = stream.dequeue_buffer() else { return };
+                let requested = buffer.requested() as usize;
+                let Some(data) = buffer.datas_mut().first_mut() else { return };
+                let frames = {
+                    let Some(bytes) = data.data() else { return };
+                    let cap = bytes.len() / BYTES_PER_FRAME;
+                    let frames = if requested > 0 { requested.min(cap) } else { cap };
+
+                    let mut b = bridge.lock().unwrap();
+                    if !b.primed && b.q.len() >= frames * CHANNELS * 2 {
+                        b.primed = true;
+                    }
+                    if b.primed && b.q.len() < frames * CHANNELS {
+                        b.primed = false; // underrun: emit silence until the ring refills
+                    }
+                    for out in bytes[..frames * BYTES_PER_FRAME].chunks_exact_mut(4) {
+                        let v = if b.primed { b.q.pop_front().unwrap_or(0.0) } else { 0.0 };
+                        out.copy_from_slice(&v.to_le_bytes());
+                    }
+                    frames
+                };
+                let chunk = data.chunk_mut();
+                *chunk.offset_mut() = 0;
+                *chunk.stride_mut() = BYTES_PER_FRAME as i32;
+                *chunk.size_mut() = (frames * BYTES_PER_FRAME) as u32;
+            })
+            .register()?;
+        let pod_bytes = format_pod();
+        let mut params = [Pod::from_bytes(&pod_bytes).expect("format pod")];
+        let flags = STREAM_FLAGS | pw::stream::StreamFlags::DONT_RECONNECT;
+        out.connect(spa::utils::Direction::Output, None, flags, &mut params)?;
+        Ok(Self { _listener: out_listener, stream: out })
+    }
 }

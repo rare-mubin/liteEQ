@@ -2,12 +2,13 @@
 //! takeover and volume sync, and answers the TUI over a Unix socket. It runs
 //! headless, so the effect keeps working whether or not the TUI is open.
 
-use crate::audio::{self, Shared, Status};
+use crate::audio::{self, Cmd, Shared, Status};
 use crate::ipc::{self, Served};
 use crate::settings::{self, Settings};
 use crate::sysaudio;
 use crate::volsync::VolSync;
 use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -95,12 +96,103 @@ fn wait_for_output(args: &Args) -> Option<String> {
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && !STOP.load(Ordering::Relaxed) {
-        if let Some(d) = sysaudio::default_sink().filter(|d| *d != args.name) {
+        if let Some(d) = sysaudio::default_sink().filter(|d| *d != args.name && d != sysaudio::DUMMY_SINK) {
             return Some(d);
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     None
+}
+
+/// Keeps the output on a live device: follows the user's choice of output and
+/// moves off a device that went away (unplugged headphones, a profile switch,
+/// a Bluetooth disconnect). The session manager destroys our playback stream
+/// when its device disappears (`node.dont-reconnect`), so it is rebuilt here.
+struct Follow {
+    name: String,
+    target: String,
+    /// `--output` was given: stay on it, only rebuild the stream when needed.
+    pinned: bool,
+    /// We took over the default output and take it back when the user picks a device.
+    own_default: bool,
+    /// Set by `pactl subscribe` when sinks come and go or the default changes.
+    events: Arc<AtomicBool>,
+    monitor: Option<Child>,
+    last_poll: Instant,
+    last_retarget: Instant,
+}
+
+impl Follow {
+    fn new(args: &Args, target: String, own_default: bool) -> Self {
+        let events = Arc::new(AtomicBool::new(false));
+        let monitor = Command::new("pactl").arg("subscribe").stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok().map(|mut child| {
+            let stdout = child.stdout.take().expect("piped stdout");
+            let events = events.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    let sink_added_or_removed = line.contains(" on sink #") && !line.contains("'change'");
+                    if sink_added_or_removed || line.contains(" on server") {
+                        events.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            child
+        });
+        Self {
+            name: args.name.clone(),
+            target,
+            pinned: args.output.is_some(),
+            own_default,
+            events,
+            monitor,
+            last_poll: Instant::now(),
+            last_retarget: Instant::now(),
+        }
+    }
+
+    /// The device to move the output to, if it should move (or be rebuilt).
+    fn check(&mut self, shared: &Shared) -> Option<String> {
+        let dead = !shared.output_ok.load(Ordering::Relaxed) && self.last_retarget.elapsed() >= Duration::from_secs(3);
+        let poll = self.last_poll.elapsed() >= Duration::from_secs(10);
+        if !(self.events.swap(false, Ordering::Relaxed) || poll || dead) {
+            return None;
+        }
+        self.last_poll = Instant::now();
+        let sinks: Vec<(String, i64)> =
+            sysaudio::sinks().into_iter().filter(|(s, _)| *s != self.name && s != sysaudio::DUMMY_SINK).collect();
+        let has = |n: &str| sinks.iter().any(|(s, _)| s == n);
+        let mut want = self.target.clone();
+        if !self.pinned {
+            if let Some(d) = sysaudio::default_sink().filter(|d| has(d)) {
+                // The user picked another output: play there, and stay in front of it.
+                want = d;
+                if self.own_default {
+                    sysaudio::set_default_sink(&self.name);
+                }
+            }
+            if !has(&want) {
+                // Our device is gone: take the one the session manager would prefer.
+                if let Some((best, _)) = sinks.iter().max_by_key(|(_, p)| *p) {
+                    want = best.clone();
+                }
+            }
+        }
+        if !has(&want) || (want == self.target && !dead) {
+            return None; // nothing to move to yet, or nothing to do
+        }
+        self.target = want.clone();
+        self.last_retarget = Instant::now();
+        Some(want)
+    }
+}
+
+impl Drop for Follow {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.monitor.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 pub fn run(args: Args) -> ExitCode {
@@ -147,12 +239,12 @@ fn serve(args: &Args, shared: &Arc<Shared>) -> ExitCode {
     };
     *shared.route.lock().unwrap() = format!("{} → {}", args.name, target);
 
-    let (quit_tx, quit_rx) = pipewire::channel::channel::<()>();
+    let (cmd_tx, cmd_rx) = pipewire::channel::channel::<Cmd>();
     let audio_thread = {
         let shared = shared.clone();
         let (name, target) = (args.name.clone(), Some(target.clone()));
         std::thread::spawn(move || {
-            if let Err(e) = audio::run(shared.clone(), name, target, quit_rx) {
+            if let Err(e) = audio::run(shared.clone(), name, target, cmd_rx) {
                 *shared.status.lock().unwrap() = Status::Error(e.to_string());
             }
         })
@@ -169,7 +261,8 @@ fn serve(args: &Args, shared: &Arc<Shared>) -> ExitCode {
         }
     }
     let sync_volume = args.volume_sync.unwrap_or(!args.no_default && takeover_ok);
-    let volsync = sync_volume.then(|| VolSync::start(args.name.clone(), target.clone()));
+    let mut volsync = sync_volume.then(|| VolSync::start(args.name.clone(), target.clone()));
+    let mut follow = Follow::new(args, target.clone(), takeover_ok);
 
     // Idle until asked to stop; persist settings shortly after they change.
     let mut saved: Settings = *shared.settings.lock().unwrap();
@@ -183,14 +276,26 @@ fn serve(args: &Args, shared: &Arc<Shared>) -> ExitCode {
                 settings::save(&now);
                 saved = now;
             }
+            if let Some(dev) = follow.check(shared) {
+                eprintln!("lite-eq: output → {dev}");
+                let _ = cmd_tx.send(Cmd::Retarget(dev.clone()));
+                *shared.route.lock().unwrap() = format!("{} → {}", args.name, dev);
+                if guard.0.is_some() {
+                    guard.0 = Some(dev.clone()); // on exit, hand the default to the current device
+                }
+                if volsync.take().is_some() {
+                    volsync = Some(VolSync::start(args.name.clone(), dev));
+                }
+            }
         }
     }
     let crashed = audio_thread.is_finished() && !STOP.load(Ordering::Relaxed);
 
     STOP.store(true, Ordering::SeqCst); // also ends the accept loop
+    drop(follow);
     drop(volsync);
     drop(guard); // move apps back to the real output before the sink disappears
-    let _ = quit_tx.send(());
+    let _ = cmd_tx.send(Cmd::Quit);
     let _ = audio_thread.join();
     settings::save(&shared.settings.lock().map(|s| *s).unwrap_or_default());
 

@@ -1,6 +1,6 @@
 # liteEQ
 
-**Version 0.1.0**
+**Version 0.1.1**
 
 A lightweight terminal bass enhancer for Linux and Windows, written in Rust. It uses the same
 DSP as the Calf Bass Enhancer in EasyEffects, with a dot
@@ -121,6 +121,11 @@ lite-eq --version   # show the version
 While it runs, all audio goes through the effect, and your volume keys control the
 real output device as usual. Stopping the service restores your previous output.
 
+Switching outputs works while it runs: pick another device in your system sound
+settings and liteEQ moves the effect there and stays the default output. If the
+device disappears (headphones unplugged, Bluetooth disconnected), it moves to
+the next available one by itself, with no restart needed.
+
 - **Mouse:** click or drag sliders, right-click or double-click to reset.
 - **Keyboard:** `↑↓` select, `←→` adjust, `r` reset, `l` listen, `b` bypass, `v` change view, `q` quit.
 - **Settings** (button at the top, or `,`): start or stop the service, start at login, keep running after closing the app.
@@ -133,6 +138,17 @@ cargo uninstall liteeq
 ```
 
 If you turned on start at login, switch it off in Settings first.
+
+## Changelog
+
+**0.1.1**
+- Linux: switching or unplugging the output device no longer breaks the effect.
+  The service follows the device you pick and recovers when a device disappears.
+- Linux: start at login waits for the real sound card, instead of attaching to
+  PipeWire's silent placeholder output when it starts too early.
+
+**0.1.0**
+- First release: Linux (PipeWire service) and Windows (Equalizer APO plugin).
 
 ## Licence
 

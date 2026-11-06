@@ -78,6 +78,9 @@ back. `channelmix.disable` does NOT stop the sink volume being applied — don't
 **PipeWire/WirePlumber gotchas encoded in the code:**
 - The output stream sets `node.dont-reconnect` + `StreamFlags::DONT_RECONNECT`; without it WirePlumber re-links
   it to the new default sink (`liteeq_sink` itself) → feedback loop, no sound.
+  The flip side: when its device disappears (unplug, UCM profile switch — e.g. HiFi Headphones/Speaker are
+  separate sinks) WirePlumber *destroys* the stream. `daemon.rs` `Follow` rebuilds it (`audio::Cmd::Retarget`),
+  follows the user's choice of default (then takes the default back) and skips the `auto_null` placeholder.
 - WirePlumber persists sink volume/mute per `media.name` (derived from `--name`, `_`→`-`) and restores it on the
   next start. Anything that mutes/lowers a sink named `liteeq_sink` poisons the next real launch.
 - Default sink is taken over at start and restored on exit (`DefaultSinkGuard`); the service also handles SIGTERM.

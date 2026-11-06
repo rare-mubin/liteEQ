@@ -1,6 +1,6 @@
 [package]
 name = "liteeq"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT AND LGPL-2.0-or-later"
 description = "Lightweight terminal bass enhancer (Calf Bass Enhancer DSP on a PipeWire virtual sink / WASAPI virtual cable)"
